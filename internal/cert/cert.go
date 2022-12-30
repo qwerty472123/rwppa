@@ -23,7 +23,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"time"
@@ -35,11 +34,11 @@ import (
 // TODO: do not hardcode filename.
 func GetCA() ([]byte, []byte, error) {
 	if fileExists("rootCA.crt") && fileExists("rootCA.key") {
-		caCert, err := ioutil.ReadFile("rootCA.crt")
+		caCert, err := os.ReadFile("rootCA.crt")
 		if err != nil {
 			return nil, nil, err
 		}
-		caKey, err := ioutil.ReadFile("rootCA.key")
+		caKey, err := os.ReadFile("rootCA.key")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -87,11 +86,11 @@ func GetCA() ([]byte, []byte, error) {
 	err = keyOut.Close()
 	panicOnErr(err)
 
-	caCert, err := ioutil.ReadFile("rootCA.crt")
+	caCert, err := os.ReadFile("rootCA.crt")
 	if err != nil {
 		return nil, nil, err
 	}
-	caKey, err := ioutil.ReadFile("rootCA.key")
+	caKey, err := os.ReadFile("rootCA.key")
 	if err != nil {
 		return nil, nil, err
 	}

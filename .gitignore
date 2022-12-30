@@ -17,6 +17,7 @@
 # Visual Studio Code
 .vscode/*
 *.code-workspace
+.idea
 
 # Local History for Visual Studio Code
 .history/
@@ -28,3 +29,8 @@
 # Binary
 rwppa*
 
+*_cfg.json
+
+run.bat
+build.bat
+kill.bat

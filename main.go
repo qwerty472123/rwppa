@@ -30,42 +30,57 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"os"
-
 	"github.com/coolspring8/rwppa/internal/proxy"
 	"github.com/coolspring8/rwppa/pkg/rvpn"
-	"golang.org/x/crypto/ssh/terminal"
+	"os"
 )
 
+type StartupConf struct {
+	// FilterId is the filter id in WebVPN(some filter will change the content, others won't)
+	// 1 - HTML, 2 - CSS, 3 - JS, 4 - VBS
+	FilterId uint64 `json:"filterId"`
+	// VpnURL is the url which provided ancient Sangfor WebVPN
+	// Examples: https://rvpn.zju.edu.cn
+	VpnURL string `json:"vpnURL"`
+	// Username is WebVPN network service account username.
+	Username string `json:"username"`
+	// Password is WebVPN network service account password.
+	Password string `json:"password"`
+	// ListenAddr is where proxy to listen.
+	ListenAddr string `json:"listenAddr"`
+}
+
+func (conf *StartupConf) Run() {
+	twfidGetter := func() string {
+		w := rvpn.WebPortal{VpnURL: conf.VpnURL, Username: conf.Username, Password: conf.Password}
+		twfid, err := w.DoLogIn()
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("Current TWFID:", *twfid)
+		return *twfid
+	}
+	vpnAccessURLPrefix := conf.VpnURL + "/web/" + fmt.Sprintf("%d", conf.FilterId) + "/"
+	proxy.StartProxyServer(conf.ListenAddr, twfidGetter, vpnAccessURLPrefix)
+}
+
 func main() {
-	// Stay calm with this temporary solution, we are going to refactor all these codes on input.
-	var username string
-	var password string
-	var listenAddr string
-	fmt.Println("Username:")
-	_, err := fmt.Scanln(&username)
+	args := os.Args[1:]
+	if len(args) != 1 {
+		fmt.Printf("Usage: %s [conf]\n", os.Args[0])
+		return
+	}
+	fn := args[0]
+	buf, err := os.ReadFile(fn)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("Password:")
-	pw, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	var conf StartupConf
+	err = json.Unmarshal(buf, &conf)
 	if err != nil {
 		panic(err)
 	}
-	password = string(pw)
-	fmt.Println("")
-	fmt.Println("Listen Address:")
-	_, err = fmt.Scanln(&listenAddr)
-	if err != nil {
-		panic(err)
-	}
-
-	w := rvpn.WebPortal{Username: username, Password: password}
-	twfid, err := w.DoLogIn()
-	if err != nil {
-		panic(err)
-	}
-
-	proxy.StartProxyServer(listenAddr, *twfid)
+	conf.Run()
 }

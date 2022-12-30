@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/coolspring8/rwppa/internal/cert"
 	"github.com/elazarl/goproxy"
@@ -34,10 +35,10 @@ import (
 
 var (
 	// RVPNURLMatcher detects RVPN-modified URLs.
-	RVPNURLMatcher *regexp.Regexp = regexp.MustCompile(`/web/[0-3]/(https?)/[0-2]/`)
+	RVPNURLMatcher *regexp.Regexp = regexp.MustCompile(`/web/[0-9]/(https?)/[0-2]/`)
 
 	// MovedLocationURLMatcher detects RVPN-modified URL in the 3xx response's Location header.
-	MovedLocationURLMatcher *regexp.Regexp = regexp.MustCompile(`https://.*:443/web/[0-3]/(https?)/[0-2]/`)
+	MovedLocationURLMatcher *regexp.Regexp = regexp.MustCompile(`https://.*:\d+/web/[0-9]/(https?)/[0-2]/`)
 
 	// IsOPTIONSRequest checks whether the request's method is OPTIONS.
 	IsOPTIONSRequest goproxy.ReqCondition = goproxy.ReqConditionFunc(
@@ -71,8 +72,25 @@ type reqData struct {
 	rawURLWithoutPort string
 }
 
+type TwfidCache struct {
+	cached      bool
+	twfidCache  string
+	twfidGetter func() string
+	mutex       sync.Mutex
+}
+
+func (t *TwfidCache) Get(forceUpdate bool) string {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	if forceUpdate || !t.cached {
+		t.twfidCache = t.twfidGetter()
+		t.cached = true
+	}
+	return t.twfidCache
+}
+
 // StartProxyServer starts a proxy server listening at the given address with the given TWFID.
-func StartProxyServer(listenAddr, twfid string) {
+func StartProxyServer(listenAddr string, twfidGetter func() string, vpnAccessURLPrefix string) {
 	caCert, caKey, err := cert.GetCA()
 	if err != nil {
 		panic(err)
@@ -85,15 +103,39 @@ func StartProxyServer(listenAddr, twfid string) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = true
 
+	twfidCache := &TwfidCache{
+		cached:      false,
+		twfidCache:  "",
+		twfidGetter: twfidGetter,
+		mutex:       sync.Mutex{},
+	}
+
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
-	proxy.OnRequest().Do(goproxy.FuncReqHandler(SendToRVPNHandler(twfid)))
+	proxy.OnRequest().Do(goproxy.FuncReqHandler(SendToRVPNHandler(twfidCache, vpnAccessURLPrefix)))
 	proxy.OnRequest(IsOPTIONSRequest).DoFunc(OPTIONSRequestHandler)
 
+	proxy.OnResponse(goproxy.StatusCodeIs(403)).DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		// Auto-reconnect when disconnected
+		req := *resp.Request
+		cookies := req.Cookies()
+		req.Header.Del("Cookie")
+		for _, cookie := range cookies {
+			if cookie.Name == "TWFID" {
+				continue
+			}
+			req.AddCookie(cookie)
+		}
+		req.AddCookie(&http.Cookie{Name: "TWFID", Value: twfidCache.Get(true)})
+		newResp, err := ctx.RoundTrip(&req)
+		if err != nil {
+			return resp
+		}
+		return newResp
+	})
 	proxy.OnResponse(HasMovedLocationHeader).DoFunc(MovedLocationHandler)
 	proxy.OnResponse(IsWebRelatedText).Do(WebTextHandler())
 
-	fmt.Println("Current TWFID:" + twfid)
-	fmt.Println("Listen Address:" + listenAddr)
+	fmt.Println("Listen Address:", listenAddr)
 	log.Fatal(http.ListenAndServe(listenAddr, proxy))
 }
 
@@ -116,7 +158,7 @@ func SetCA(caCert, caKey []byte) error {
 }
 
 // SendToRVPNHandler sends the original request to RVPN web portal.
-func SendToRVPNHandler(twfid string) func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+func SendToRVPNHandler(twfidGetter *TwfidCache, vpnAccessURLPrefix string) func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 	return func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		// store rawURL for later use
 		rawURLWithPort := req.URL.String()
@@ -131,13 +173,13 @@ func SendToRVPNHandler(twfid string) func(req *http.Request, ctx *goproxy.ProxyC
 		// TODO: add other missed fields in "type URL struct" if necessary, like "User"
 		// port has been included in "Host"
 		if req.URL.RawQuery != "" {
-			newURL, err := url.Parse("https://rvpn.zju.edu.cn/web/2/" + req.URL.Scheme + "/0/" + req.URL.Host + req.URL.Path + "?" + req.URL.RawQuery)
+			newURL, err := url.Parse(vpnAccessURLPrefix + req.URL.Scheme + "/0/" + req.URL.Host + req.URL.Path + "?" + req.URL.RawQuery)
 			if err != nil {
 				return req, nil // this rarely happens?
 			}
 			req.URL = newURL
 		} else {
-			newURL, err := url.Parse("https://rvpn.zju.edu.cn/web/2/" + req.URL.Scheme + "/0/" + req.URL.Host + req.URL.Path)
+			newURL, err := url.Parse(vpnAccessURLPrefix + req.URL.Scheme + "/0/" + req.URL.Host + req.URL.Path)
 			if err != nil {
 				return req, nil
 			}
@@ -145,14 +187,14 @@ func SendToRVPNHandler(twfid string) func(req *http.Request, ctx *goproxy.ProxyC
 		}
 
 		// add cookie for web portal verification
-		req.AddCookie(&http.Cookie{Name: "TWFID", Value: twfid})
+		req.AddCookie(&http.Cookie{Name: "TWFID", Value: twfidGetter.Get(false)})
 
 		return req, nil
 	}
 }
 
 // OPTIONSRequestHandler skips sending the request and returns a response designed for CORS preflight request.
-func OPTIONSRequestHandler(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+func OPTIONSRequestHandler(req *http.Request, _ *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 	resp := goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusOK, "")
 	resp.Header.Add("Access-Control-Allow-Credentials", "true")
 	resp.Header.Add("Access-Control-Allow-Headers", "authorization, content-type")
@@ -162,7 +204,7 @@ func OPTIONSRequestHandler(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Requ
 }
 
 // MovedLocationHandler fixes redirections.
-func MovedLocationHandler(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+func MovedLocationHandler(resp *http.Response, _ *goproxy.ProxyCtx) *http.Response {
 	respLocation := resp.Header.Get("Location")
 	newLocation := MovedLocationURLMatcher.ReplaceAllString(respLocation, "$1://")
 	resp.Header.Set("Location", newLocation)
